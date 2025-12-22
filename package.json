@@ -1,0 +1,16 @@
+{
+  "name": "realtime-call-recorder",
+  "version": "1.0.0",
+  "description": "Production-grade interrupt-aware call recorder with real-time mixing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "author": "emir şener",
+  "license": "ISC",
+  "dependencies": {
+    "ws": "^8.16.0",
+    "uuid": "^9.0.1"
+  }
+}

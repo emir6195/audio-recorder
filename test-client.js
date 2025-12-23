@@ -222,6 +222,8 @@ async function runTest() {
 
   // 8. End session
   console.log('')
-  console.log('🛑 Ending session... (sending end: true)')
+  console.log('🛑 Ending session... (sending end: true and closing)')
   sendEnd()
+  await sleep(500)
+  ws.close()
 }

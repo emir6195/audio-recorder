@@ -197,18 +197,6 @@ class WebSocketServer {
       return
     }
 
-    // Handle end
-    if (msg.end === true) {
-      this.handleEnd(ws)
-      return
-    }
-
-    // Handle status
-    if (msg.status === true) {
-      this.handleStatus(ws)
-      return
-    }
-
     // Legacy support: type-based messages
     if (msg.type) {
       this.handleLegacyMessage(ws, msg)
@@ -245,55 +233,7 @@ class WebSocketServer {
           msDiscarded: info.msDiscarded
         })
         break
-
-      case 'end':
-        this.handleEnd(ws)
-        break
-
-      case 'status':
-        this.handleStatus(ws)
-        break
     }
-  }
-
-  /**
-   * Handle end message
-   */
-  handleEnd(ws) {
-    const sessionData = this.sessions.get(ws)
-    if (!sessionData) {
-      this.sendError(ws, 'No active session')
-      return
-    }
-
-    const { session, sessionId, channel } = sessionData
-    const summary = session.end()
-    this.sessions.delete(ws)
-
-    this.send(ws, {
-      type: 'ended',
-      ...summary,
-      channel
-    })
-  }
-
-  /**
-   * Handle status request
-   */
-  handleStatus(ws) {
-    const sessionData = this.sessions.get(ws)
-    if (!sessionData) {
-      this.send(ws, { type: 'status', active: false })
-      return
-    }
-
-    const { session, channel } = sessionData
-
-    this.send(ws, {
-      type: 'status',
-      channel,
-      ...session.getStatus()
-    })
   }
 
   /**

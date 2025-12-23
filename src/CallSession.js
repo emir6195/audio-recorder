@@ -12,8 +12,8 @@
  */
 
 const AudioBufferQueue = require('./AudioBufferQueue')
-const BotPlayback = require('./BotPlayback')
 const WavWriter = require('./WavWriter')
+const fs = require('fs')
 const { silence, pad, getMixer } = require('./AudioMixer')
 const UlawCodec = require('./UlawCodec')
 const { v4: uuidv4 } = require('uuid')
@@ -44,7 +44,8 @@ class CallSession {
 
     // Buffers
     this.userBuffer = new AudioBufferQueue()
-    this.botPlayback = new BotPlayback(format, this.shortId)
+    this.botEvents = [] // { startTime, arrivalTime, data, duration, interruptedAt }
+    this.botNextStartTime = 0 // Next available slot for sequential bot playback
 
     // Mixer
     this.mix = getMixer(format.encoding)
@@ -149,10 +150,7 @@ class CallSession {
     }
     const userHasAudio = this.hasAudio(userFrame)
 
-
-    // Enforce user buffer limit (format-aware duration)
-    // Calculate bytes for max allowed duration (e.g. 500ms)
-    // bytes = (ms / frameMs) * frameBytes = (ms / 1000) * sampleRate * bytesPerSample
+    // Enforce user buffer limit
     const itemsPerSec = this.format.sampleRate * this.format.bytesPerSample
     const userMaxBytes = (BUFFER_LIMITS.maxUserBufferMs / 1000) * itemsPerSec
 
@@ -161,52 +159,18 @@ class CallSession {
       this.log(`⚠️  User buffer cap: dropped ${dropped}b (${BUFFER_LIMITS.maxUserBufferMs}ms limit)`)
     }
 
-    // Get bot frame (handled by BotPlayback FSM)
-    const botBufferBefore = this.botPlayback.getBufferSize()
-    const botStateBefore = this.botPlayback.getState()
-    const botFrame = this.botPlayback.frame()
-    const botHasAudio = this.hasAudio(botFrame)
-    const botStateAfter = this.botPlayback.getState()
-
-    // Mix frames
-    const mixed = this.mix(userFrame, botFrame)
-
-    // Write to recording
-    this.wavWriter.write(mixed)
+    // Write ONLY user audio to recording
+    this.wavWriter.write(userFrame)
 
     this.frameCount++
     this.stats.framesWritten++
 
-    // Log every 50 frames (1 second) or on state changes
-    // OVERLAP LOGGING: Only log on rising edge (start of overlap) or periodically
-    const isOverlap = userHasAudio && botHasAudio
-
-    if (isOverlap) {
-      if (this.overlapCount === 0) {
-        // Rising edge - log immediately
-        this.overlapStartFrame = this.frameCount
-        this.log(`⚠️  OVERLAP STARTED! Frame ${this.frameCount}`)
-      }
-      this.overlapCount++
-    } else {
-      if (this.overlapCount > 0) {
-        this.log(`✅ OVERLAP ENDED. Duration: ${this.overlapCount} frames`)
-        this.overlapCount = 0
-      }
-    }
-
-    const shouldLog = this.frameCount % 50 === 0 ||
-      botStateBefore !== botStateAfter ||
-      (isOverlap && this.overlapCount % 50 === 0) // Log overlap every 1s, not every frame
+    const shouldLog = this.frameCount % 50 === 0
 
     if (shouldLog) {
       const userStatus = userHasData ? (userHasAudio ? '🎤AUDIO' : '🔇silent') : '⬜empty'
-      const botStatus = botHasAudio ? '🤖AUDIO' : '⬜silent'
-      const overlapMsg = isOverlap ? `⚠️ OVERLAP! (+${this.overlapCount})` : ''
-
       this.log(`🎬 Frame ${this.frameCount.toString().padStart(4)} | ` +
-        `User[${userBufferBefore.toString().padStart(5)}b→${userStatus}] | ` +
-        `Bot[${botStateBefore}→${botStateAfter}, ${botBufferBefore.toString().padStart(5)}b→${botStatus}] ${overlapMsg}`)
+        `User[${userBufferBefore.toString().padStart(5)}b→${userStatus}]`)
     }
 
     // Callback
@@ -215,8 +179,7 @@ class CallSession {
         frameNumber: this.frameCount,
         timestamp: Date.now() - this.startTime,
         userBufferSize: this.userBuffer.size(),
-        botBufferSize: this.botPlayback.getBufferSize(),
-        botState: this.botPlayback.getState()
+        botEventsCount: this.botEvents.length
       })
     }
   }
@@ -252,44 +215,89 @@ class CallSession {
     if (!this.active) return
 
     const buffer = Buffer.from(base64Data, 'base64')
-    const hasAudio = this.hasAudio(buffer)
-    const bufferBefore = this.botPlayback.getBufferSize()
-    const stateBefore = this.botPlayback.getState()
+    const arrivalTime = Date.now() - this.startTime
+    const durationMs = (buffer.length / this.frameBytes) * this.frameMs
 
-    this.botPlayback.feed(buffer)
+    // Queue bot chunks sequentially if they arrive faster than real-time
+    const startTime = Math.max(arrivalTime, this.botNextStartTime)
+
+    this.botEvents.push({
+      startTime,
+      arrivalTime,
+      data: buffer,
+      duration: durationMs,
+      interruptedAt: null
+    })
+
+    this.botNextStartTime = startTime + durationMs
     this.stats.botChunks++
     this.stats.botBytesTotal += buffer.length
 
-    // Log bot audio arrival
-    const durationMs = (buffer.length / this.frameBytes) * this.frameMs
-    this.log(`📥 BOT  audio: ${buffer.length}b (${durationMs.toFixed(0)}ms) | ` +
-      `HasAudio: ${hasAudio} | State: ${stateBefore}→${this.botPlayback.getState()} | ` +
-      `Buffer: ${bufferBefore}→${this.botPlayback.getBufferSize()}b`)
+    this.log(`📥 BOT audio: ${buffer.length}b (${durationMs.toFixed(0)}ms) | Queue: ${startTime.toFixed(0)}ms - ${this.botNextStartTime.toFixed(0)}ms (Arrived: ${arrivalTime}ms)`)
   }
 
   /**
    * Handle interrupt event
-   * Immediately stops bot playback and clears buffer
+   * Tracks interruption timestamp and trims/discards bot chunks
    * @returns {Object} - Interrupt info
    */
   handleInterrupt() {
     if (!this.active) return null
 
-    const bufferBefore = this.botPlayback.getBufferSize()
-    const stateBefore = this.botPlayback.getState()
-
-    const bytesDiscarded = this.botPlayback.stop()
+    const timestamp = Date.now() - this.startTime
     this.stats.interrupts++
 
-    const info = {
-      timestamp: Date.now() - this.startTime,
-      frameNumber: this.frameCount,
-      bytesDiscarded,
-      msDiscarded: (bytesDiscarded / this.frameBytes) * this.frameMs
+    let bytesDiscarded = 0
+    let msDiscarded = 0
+
+    // 1. Discard all chunks that haven't started "playing" yet
+    const initialCount = this.botEvents.length
+    this.botEvents = this.botEvents.filter(e => {
+      if (e.startTime >= timestamp) {
+        bytesDiscarded += e.data.length
+        msDiscarded += e.duration
+        return false
+      }
+      return true
+    })
+    const discardedPastCount = initialCount - this.botEvents.length
+
+    // 2. Trim the chunk that is currently "playing"
+    const currentChunk = this.botEvents[this.botEvents.length - 1]
+    if (currentChunk) {
+      const eventEnd = currentChunk.startTime + currentChunk.duration
+      if (timestamp < eventEnd) {
+        // Interruption happened DURING this bot chunk
+        currentChunk.interruptedAt = timestamp
+
+        const oldDuration = currentChunk.duration
+        currentChunk.duration = Math.max(0, timestamp - currentChunk.startTime)
+        const diffMs = oldDuration - currentChunk.duration
+        msDiscarded += diffMs
+
+        const framesToKeep = Math.floor(currentChunk.duration / this.frameMs)
+        const bytesToKeep = framesToKeep * this.frameBytes
+
+        bytesDiscarded += (currentChunk.data.length - bytesToKeep)
+        currentChunk.data = currentChunk.data.slice(0, bytesToKeep)
+
+        this.log(`✋ INTERRUPT! Trimming active chunk: ${oldDuration.toFixed(0)}ms → ${currentChunk.duration.toFixed(0)}ms`)
+      }
     }
 
-    this.log(`✋ INTERRUPT! State: ${stateBefore}→${this.botPlayback.getState()} | ` +
-      `Discarded: ${bytesDiscarded}b (${info.msDiscarded.toFixed(0)}ms)`)
+    // Reset next start time
+    this.botNextStartTime = timestamp
+
+    if (discardedPastCount > 0) {
+      this.log(`✋ INTERRUPT! Discarded ${discardedPastCount} future chunks (-${msDiscarded.toFixed(0)}ms total)`)
+    }
+
+    const info = {
+      timestamp,
+      frameNumber: this.frameCount,
+      bytesDiscarded,
+      msDiscarded
+    }
 
     return info
   }
@@ -315,22 +323,67 @@ class CallSession {
       this.schedulerHandle = null
     }
 
-    // Drain remaining buffers (one more frame each)
-    this.processFrame()
+    // 1. Drain remaining user buffer
+    const remainingUserBytes = this.userBuffer.size()
+    if (remainingUserBytes > 0) {
+      this.log(`📥 Draining user buffer: ${remainingUserBytes}b remaining`)
+      const remainingUserAudio = this.userBuffer.pull(remainingUserBytes)
+      this.wavWriter.write(remainingUserAudio)
+    }
 
-    // Finalize WAV
-    const wavInfo = this.wavWriter.finalize()
+    // 2. Pad to match the longest timeline (user vs bot)
+    // We calculate exactly how many bytes are needed to contain all audio
+    let maxBotEndBytes = 0
+    for (const e of this.botEvents) {
+      const offsetSamples = Math.floor((e.startTime / 1000) * this.format.sampleRate)
+      const offsetBytes = offsetSamples * this.format.bytesPerSample
+      maxBotEndBytes = Math.max(maxBotEndBytes, offsetBytes + e.data.length)
+    }
 
-    this.log(`💾 Recording saved: ${wavInfo.path} (${wavInfo.durationSec.toFixed(2)}s)`)
+    const sessionDurationMs = Date.now() - this.startTime
+    const sessionBytes = Math.floor((sessionDurationMs / 1000) * this.format.sampleRate) * this.format.bytesPerSample
+
+    const targetBytes = Math.max(sessionBytes, maxBotEndBytes, this.wavWriter.dataSize)
+
+    if (this.wavWriter.dataSize < targetBytes) {
+      const paddingBytes = targetBytes - this.wavWriter.dataSize
+      this.log(`🤫 Padding recording with ${paddingBytes} bytes to match longest stream (~${(paddingBytes / this.format.sampleRate / this.format.bytesPerSample * 1000).toFixed(0)}ms)`)
+      this.wavWriter.write(silence(paddingBytes, this.encoding))
+    }
+
+    // Finalize user WAV
+    const userWavInfo = this.wavWriter.finalize()
+    this.log(`💾 User-only recording finalized: ${userWavInfo.path} (${userWavInfo.durationSec.toFixed(2)}s)`)
+
+    // Merge bot audio into user recording
+    const finalWavInfo = this.mergeFinalResult(userWavInfo)
+
+    // Save metadata
+    const metadataPath = path.join(this.recordingsDir, `${this.sessionId}_metadata.json`)
+    const metadata = {
+      sessionId: this.sessionId,
+      startTime: this.startTime,
+      endTime: Date.now(),
+      duration: Date.now() - this.startTime,
+      format: this.format,
+      stats: this.stats,
+      botEvents: this.botEvents.map(e => ({
+        startTime: e.startTime,
+        arrivalTime: e.arrivalTime,
+        duration: e.duration,
+        interruptedAt: e.interruptedAt,
+        dataLength: e.data.length
+      }))
+    }
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2))
+    this.log(`💾 Metadata saved: ${metadataPath}`)
 
     const summary = {
       sessionId: this.sessionId,
-      duration: Date.now() - this.startTime,
-      recording: wavInfo,
-      stats: {
-        ...this.stats,
-        botPlayback: this.botPlayback.getStats()
-      }
+      duration: metadata.duration,
+      recording: finalWavInfo,
+      metadata: metadataPath,
+      stats: this.stats
     }
 
     // Callback
@@ -339,6 +392,59 @@ class CallSession {
     }
 
     return summary
+  }
+
+  /**
+   * Merge bot chunks into the final user-only recording
+   * @param {Object} userWavInfo - Info about the user-only WAV
+   * @returns {Object} - Final WAV info
+   */
+  mergeFinalResult(userWavInfo) {
+    this.log(`🔀 Merging bot chunks into final recording...`)
+
+    try {
+      // Read user audio data (skip 44-byte header)
+      const userFileBuffer = fs.readFileSync(userWavInfo.path)
+      const audioData = userFileBuffer.slice(44)
+
+      // Mix each bot chunk at correct offset
+      for (const event of this.botEvents) {
+        // Calculate offset in bytes
+        // offsetSamples = (timestampMs / 1000) * sampleRate
+        // offsetBytes = offsetSamples * bytesPerSample
+        const offsetSamples = Math.floor((event.startTime / 1000) * this.format.sampleRate)
+        const offsetBytes = offsetSamples * this.format.bytesPerSample
+
+        if (offsetBytes + event.data.length > audioData.length) {
+          // If bot chunk extends beyond user audio (rare but possible), skip or pad
+          this.log(`⚠️ Bot chunk @ ${event.startTime}ms extends beyond user audio. Clipping.`)
+          const available = audioData.length - offsetBytes
+          if (available <= 0) continue
+
+          const chunkToMix = event.data.slice(0, available)
+          const mixedSegment = this.mix(audioData.slice(offsetBytes, audioData.length), chunkToMix)
+          mixedSegment.copy(audioData, offsetBytes)
+        } else {
+          const mixedSegment = this.mix(audioData.slice(offsetBytes, offsetBytes + event.data.length), event.data)
+          mixedSegment.copy(audioData, offsetBytes)
+        }
+      }
+
+      // Final WAV info remains same as userWavInfo in terms of metrics
+      // but the file content is now mixed.
+      // We overwrite the file with the mixed version.
+      // Actually, let's just write back the header + mixed data.
+      userFileBuffer.copy(userFileBuffer, 44, 44, 44 + audioData.length) // Already modified audioData in place as buffer slice
+      fs.writeFileSync(userWavInfo.path, userFileBuffer)
+
+      this.log(`✅ Merging complete. Final recording: ${userWavInfo.path}`)
+      return userWavInfo
+
+    } catch (err) {
+      this.log(`❌ Error during merge: ${err.message}`)
+      console.error(err)
+      return userWavInfo // Fallback to user-only if mix fails
+    }
   }
 
   /**
@@ -352,8 +458,7 @@ class CallSession {
       uptime: Date.now() - this.startTime,
       frameCount: this.frameCount,
       userBufferSize: this.userBuffer.size(),
-      botState: this.botPlayback.getState(),
-      botBufferSize: this.botPlayback.getBufferSize(),
+      botEventsCount: this.botEvents.length,
       recordingDuration: this.wavWriter.getDurationMs(),
       stats: this.stats
     }

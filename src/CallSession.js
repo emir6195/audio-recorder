@@ -135,6 +135,14 @@ class CallSession {
   }
 
   /**
+   * Get current time in milliseconds relative to the recording timeline
+   * (Based on number of frames processed/scheduled)
+   */
+  _getRecordingTime() {
+    return this.frameCount * this.frameMs
+  }
+
+  /**
    * Process one frame (20ms)
    * Called by scheduler at fixed intervals
    */
@@ -215,7 +223,7 @@ class CallSession {
     if (!this.active) return
 
     const buffer = Buffer.from(base64Data, 'base64')
-    const arrivalTime = Date.now() - this.startTime
+    const arrivalTime = this._getRecordingTime()
     const durationMs = (buffer.length / this.frameBytes) * this.frameMs
 
     // Queue bot chunks sequentially if they arrive faster than real-time
@@ -233,7 +241,7 @@ class CallSession {
     this.stats.botChunks++
     this.stats.botBytesTotal += buffer.length
 
-    this.log(`📥 BOT audio: ${buffer.length}b (${durationMs.toFixed(0)}ms) | Queue: ${startTime.toFixed(0)}ms - ${this.botNextStartTime.toFixed(0)}ms (Arrived: ${arrivalTime}ms)`)
+    this.log(`📥 BOT audio: ${buffer.length}b (${durationMs.toFixed(0)}ms) | Queue: ${startTime.toFixed(0)}ms - ${this.botNextStartTime.toFixed(0)}ms (ArrivedRec: ${arrivalTime}ms)`)
   }
 
   /**
@@ -244,7 +252,7 @@ class CallSession {
   handleInterrupt() {
     if (!this.active) return null
 
-    const timestamp = Date.now() - this.startTime
+    const timestamp = this._getRecordingTime()
     this.stats.interrupts++
 
     let bytesDiscarded = 0
